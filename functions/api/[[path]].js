@@ -929,6 +929,44 @@ async function probeLiveBatch(channels) {
   return out;
 }
 
+
+/**
+ * 直播源探活（独立端点，不影响 /api/live/playlist 的列表内容）。
+ * GET /api/live/probe?url=<m3u>&limit=50
+ *   - 逐频道取 manifest → 记录分片数 / 是否 DRM / 末片是否可取 / playlist 序号是否推进
+ *   - limit 限制本轮探活数量（受 Workers 单请求 50 子请求约束，每频道约 2 个子请求）
+ * 返回 { total, probed, alive, dead, results: [...] }
+ */
+async function handleLiveProbe(env, request) {
+  const guarded = await guard(env, request);
+  if (guarded) return guarded;
+
+  const sp = new URL(request.url).searchParams;
+  const url = (sp.get('url') || '').trim();
+  if (!url) return jsonError('缺少 url 参数', 400);
+  if (!isAllowedUrl(url)) return jsonError('目标地址不在允许范围内（仅支持公网 http/https）', 403);
+  const limit = Math.min(50, Math.max(1, parseInt(sp.get('limit') || '20', 10) || 20));
+
+  let text;
+  try {
+    const { res } = await fetchUpstream(url, { timeoutMs: 20000, headers: { 'User-Agent': UA } });
+    if (!res.ok) return jsonError(`订阅地址请求失败: ${res.status}`, 502);
+    text = await res.text();
+  } catch (err) {
+    return jsonError(`订阅地址请求失败: ${err instanceof Error ? err.message : '未知错误'}`, 502);
+  }
+
+  const all = parseM3u(text, url);
+  const results = [];
+  const batch = all.slice(0, limit);
+  for (const ch of batch) {
+    const r = await probeLiveChannel(ch.url);
+    results.push({ name: ch.name, url: ch.url, ok: r });
+  }
+  const alive = results.filter((r) => r.ok).length;
+  return json({ total: all.length, probed: results.length, alive, dead: results.length - alive, results });
+}
+
 async function handleLivePlaylist(env, request) {
   const guarded = await guard(env, request);
   if (guarded) return guarded;
@@ -955,17 +993,10 @@ async function handleLivePlaylist(env, request) {
 
   // 只保留实测能播的频道：滚动窗口极小的源会在起播约 30 秒后因分片 404 而中断。
   // 未探活过的频道先用部署期实测基线兜底（LIVE_SEED_URLS），其余等轮转探活后再收录。
-  const probeTargets = all.filter((c) => !liveProbeCache.has(c.url) && !LIVE_SEED_URLS.has(c.url));
-  if (probeTargets.length > 0) {
-    // 轮转探活一批；失败不影响本次返回（本次先用基线结果）
-    probeLiveBatch(probeTargets).catch(() => {});
-  }
-
-  const known = new Set();
-  for (const [u, rec] of liveProbeCache) if (rec.ok) known.add(u);
-  let channels = all.filter((c) => known.has(c.url) || LIVE_SEED_URLS.has(c.url));
-  // 极端情况下（基线全失效且探活尚未轮转到位）至少保留全部，避免返回空列表
-  if (channels.length === 0) channels = all;
+  // ⚠️ 列表返回全量，不做过滤。
+  // 曾经按「分片数 / 末片可达」筛掉过一批源，但那些判据与 Media3 实际报错的对应关系没有完全验证，
+  // 过滤反而把可用的源也藏起来了。探活能力保留在 /api/live/probe 端点，按需调用。
+  const channels = all;
 
   const groups = [...new Set(channels.map((c) => c.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh'));
   const playlist = { channels, groups };
@@ -1034,6 +1065,7 @@ const ROUTES = {
   detail: { methods: ['GET'], handler: handleDetail },
   douban: { methods: ['GET'], handler: handleDouban },
   'live/playlist': { methods: ['GET'], handler: handleLivePlaylist },
+  'live/probe': { methods: ['GET'], handler: handleLiveProbe },
   'source-list': { methods: ['GET'], handler: handleSourceList },
   'source/test': { methods: ['POST'], handler: handleSourceTest },
 };
