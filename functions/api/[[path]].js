@@ -558,6 +558,52 @@ function parseSourceListPayload(text) {
   return { sources, liveSources };
 }
 
+/**
+ * 直播频道可用性基线（部署前做过一次分片级实测：取 manifest 末片 → 200 且有内容）。
+ * 作用：首次请求就能给出真实可播的列表，不必等运行时探活轮转。
+ */
+const LIVE_SEED_URLS = new Set([
+  "https://mediaserver.abnvideos.com/streams/abnchina.m3u8",
+  "https://restream.pdtvhd.com/memfs/c1cd2ed0-3b2b-4c25-af98-a7fb0b1eb130.m3u8",
+  "https://stream2.jlntv.cn/baicheng1/sd/live.m3u8",
+  "https://video.bread-tv.com:8091/hls-live24/online/index.m3u8",
+  "http://74.91.26.218:82/live/cctv1hd.m3u8",
+  "http://74.91.26.218:82/live/cctv3hd.m3u8",
+  "http://74.91.26.218:82/live/cctv12hd.m3u8",
+  "http://113.64.146.48:1688/hls/4/index.m3u8",
+  "http://play1-qk.nmtv.cn/live/1735546697341033.m3u8",
+  "http://hwapi.yntv.net/ew265l/848y54.m3u8",
+  "https://stream.sun0769.com/dgrtv1/mp4tv1_800/index.m3u8",
+  "https://h5cul1yar48um3t.wcetv.com/hls/gdsatellite.m3u8",
+  "http://111.59.24.227:8181/tsfile/live/1001_1.m3u8?key=txiptv&playlive=1&authid=0",
+  "https://tencentplaybusiness.gztv.com/live/zonghes.m3u8",
+  "https://event.pull.hebtv.com/live/live101.m3u8",
+  "https://p8.vzan.com/slowlive/415983998730568937/live.m3u8",
+  "http://hlsal-ldvt.qing.mgtv.com/nn_live/nn_x64/dWlwPTEyNy4wLjAuMSZ1aWQ9cWluZy1jbXMmbm5fdGltZXpvbmU9OCZjZG5leF9pZD1hbF9obHNfbGR2dCZ1dWlkPTliODY4NmU5ZTM2YzYwMmMmZT02OTE0NjA0JnY9MSZpZD1ITldTWkdTVCZzPTcwN2RiYTc2YzJjNmJmMTQ4MmUyZGYzOWU2NWM3YWFi/HNWSZGST.m3u8",
+  "https://stream.jmtv.com.cn/xwzh/sd/live.m3u8?_upt=341f4b8e1791883036",
+  "http://110.185.237.164:8888/hls/30/index.m3u8",
+  "https://liveplus.lzr.com.cn/xwzh/HD/live.m3u8",
+  "https://liveplus.lzr.com.cn/wlpd/HD/live.m3u8",
+  "https://cdn4.skygo.mn/live/disk1/NeigMGL/HLSv3-FTA/NeigMGL.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv1at/manifest.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv2at/manifest.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv3at/manifest.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv4at/manifest.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv5at/manifest.m3u8",
+  "http://video10.qtv.com.cn/drm/qtv6at/manifest.m3u8",
+  "http://stream2.jlntv.cn/sptv/sd/live.m3u8?_upt=f27750421743154598",
+  "http://120.70.60.179:9901/tsfile/live/1002_1.m3u8?key=txiptv&playlive=1&authid=0",
+  "http://120.70.60.179:9901/tsfile/live/1002_1.m3u8?authid=0&key=txiptv&playlive=1",
+  "https://live.vtibet.cn/live/ZYWS20261016.stream.m3u8",
+  "https://ali-m-l.cztv.com/channels/lantian/channel10/1080p.m3u8",
+]);
+
+/** 频道可用性探活缓存：url -> { ok, ts }。TTL 6 小时（源会随时间失效，缓存不宜过长）。 */
+const LIVE_PROBE_TTL = 6 * 60 * 60 * 1000;
+const liveProbeCache = new Map();
+/** 轮转游标：保证每次请求只探一批，避免超出 Workers 单请求 50 子请求的上限。 */
+let liveProbeCursor = 0;
+
 // ────────────────────────────── 内存缓存（单 isolate 内有效） ──────────────────────────────
 
 const cache = new Map();
@@ -820,6 +866,79 @@ async function handleDouban(env, request) {
   return json({ items });
 }
 
+
+/**
+ * 单频道分片级探活。
+ *
+ * 为什么必须探到分片：很多海外中转 IPTV 源的 HLS 滚动窗口极小
+ * （CCTV-2 那个源 TARGETDURATION=10，manifest 里只有 3 个分片，8 秒就滚掉一个），
+ * manifest 拿得到（HTTP 200）但分片已被回收（404）→ 播放器起播成功后约 30 秒必然报
+ * ERROR_CODE_IO_UNSPECIFIED。只看 manifest 会把这类坏源放给客户端。
+ *
+ * 手法与上游 /api/live/probe 一致：
+ * - 取 manifest → 解析出分片 URL（相对路径按 manifest 的 URL 解析）
+ * - 取**最后一个**分片（最新的，最不容易已过期）
+ * - 用 Range: bytes=0-1 轻量请求，拿到响应头即断开
+ * - 校验 #EXTM3U 前缀与 content-type，避免把 HTML/JSON 错误页当成可用
+ */
+async function probeLiveChannel(channelUrl) {
+  const cached = liveProbeCache.get(channelUrl);
+  if (cached && Date.now() - cached.ts < LIVE_PROBE_TTL) return cached.ok;
+
+  let ok = false;
+  try {
+    const base = channelUrl;
+    const { res } = await fetchUpstream(base, {
+      timeoutMs: 8000,
+      headers: { 'User-Agent': UA, Accept: '*/*' },
+    });
+    if (res.ok) {
+      const text = (await res.text()).slice(0, 200000);
+      if (text.trim().startsWith('#EXTM3U')) {
+        const segs = text.split(/\r?\n/).map((l) => l.trim())
+          .filter((l) => l && !l.startsWith('#'));
+        if (segs.length > 0) {
+          const last = new URL(segs[segs.length - 1], base).href;
+          // 轻量取分片头部
+          const sres = await fetch(last, {
+            headers: { 'User-Agent': UA, Range: 'bytes=0-1' },
+            redirect: 'follow',
+          });
+          const buf = new Uint8Array(await sres.arrayBuffer());
+          ok = sres.ok && buf.length > 0;
+          // 分片请求失败后不再重试，直接记为不可用
+          try { sres.body && sres.body.cancel(); } catch { /* ignore */ }
+        }
+      }
+    }
+  } catch {
+    ok = false;
+  }
+  liveProbeCache.set(channelUrl, { ok, ts: Date.now() });
+  return ok;
+}
+
+/**
+ * 对一批频道做分片级探活。受 Workers 单请求 50 子请求限制，每批最多 16 个频道
+ * （每频道 2 个子请求：manifest + 分片）。
+ */
+async function probeLiveBatch(channels) {
+  const BATCH = 16;
+  const out = new Map();
+  let i = liveProbeCursor;
+  for (let n = 0; n < Math.min(BATCH, channels.length); n++) {
+    const ch = channels[i % channels.length];
+    i++;
+    if (!ch) break;
+    if (!liveProbeCache.has(ch.url)) {
+      const ok = await probeLiveChannel(ch.url);
+      out.set(ch.url, ok);
+    }
+  }
+  liveProbeCursor = channels.length ? i % channels.length : 0;
+  return out;
+}
+
 async function handleLivePlaylist(env, request) {
   const guarded = await guard(env, request);
   if (guarded) return guarded;
@@ -842,7 +961,22 @@ async function handleLivePlaylist(env, request) {
     return jsonError(`订阅地址请求失败: ${err instanceof Error ? err.message : '未知错误'}`, 502);
   }
 
-  const channels = parseM3u(text, url);
+  const all = parseM3u(text, url);
+
+  // 只保留实测能播的频道：滚动窗口极小的源会在起播约 30 秒后因分片 404 而中断。
+  // 未探活过的频道先用部署期实测基线兜底（LIVE_SEED_URLS），其余等轮转探活后再收录。
+  const probeTargets = all.filter((c) => !liveProbeCache.has(c.url) && !LIVE_SEED_URLS.has(c.url));
+  if (probeTargets.length > 0) {
+    // 轮转探活一批；失败不影响本次返回（本次先用基线结果）
+    probeLiveBatch(probeTargets).catch(() => {});
+  }
+
+  const known = new Set();
+  for (const [u, rec] of liveProbeCache) if (rec.ok) known.add(u);
+  let channels = all.filter((c) => known.has(c.url) || LIVE_SEED_URLS.has(c.url));
+  // 极端情况下（基线全失效且探活尚未轮转到位）至少保留全部，避免返回空列表
+  if (channels.length === 0) channels = all;
+
   const groups = [...new Set(channels.map((c) => c.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh'));
   const playlist = { channels, groups };
   cacheSet(cacheKey, playlist, 10 * 60 * 1000);
