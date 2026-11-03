@@ -446,6 +446,8 @@ function normalizeStreamUrl(raw, baseUrl) {
   const t = String(raw || '').trim();
   if (!t) return undefined;
   try {
+    // rtmp:// 是 Media3 原生支持的流协议（浙江广电等一批源在用），不能丢
+    if (/^rtmps?:\/\//i.test(t)) return t;
     const resolved = new URL(t, baseUrl);
     if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return undefined;
     return resolved.href;
@@ -468,6 +470,25 @@ function nameFromUrl(url) {
   }
 }
 
+/**
+ * 从 #EXTINF 行取频道显示名。
+ *
+ * 不能用「去掉属性后取第一个逗号」：属性值内部可能含引号（实测有源把 tvg-logo 写成
+ * 带 "Chrome/144.0.0.0 Safari/537.36" 的 URL），那样会把属性残片当成频道名。
+ * 这里逐字符扫描，跳过引号内的内容，找第一个「引号外的逗号」——那才是属性与标题的分界。
+ */
+function extinfTitle(line) {
+  let s = String(line).replace(/^#EXTINF\s*:\s*/i, '');
+  s = s.replace(/^-?[\d.]+\s*,/, '');   // 去掉时长
+  let inQuote = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') { inQuote = !inQuote; continue; }
+    if (ch === ',' && !inQuote) return s.slice(i + 1).trim().replace(/^"+|"+$/g, '');
+  }
+  return s.trim().replace(/^"+|"+$/g, '');
+}
+
 function parseM3u(content, baseUrl) {
   const channels = [];
   if (!content) return channels;
@@ -483,9 +504,7 @@ function parseM3u(content, baseUrl) {
       ATTR_RE.lastIndex = 0;
       let m;
       while ((m = ATTR_RE.exec(line))) attrs[m[1].toLowerCase()] = m[2].trim();
-      const stripped = line.replace(ATTR_STRIP_RE, '').replace(/^#EXTINF\s*:\s*/i, '');
-      const commaIdx = stripped.indexOf(',');
-      const title = (commaIdx >= 0 ? stripped.slice(commaIdx + 1) : stripped).trim().replace(/^"+|"+$/g, '');
+      const title = extinfTitle(line);
       ctx = { attrs, title, extGroup: '' };
       continue;
     }
