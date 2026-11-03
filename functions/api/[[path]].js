@@ -564,27 +564,15 @@ function parseSourceListPayload(text) {
  */
 const LIVE_SEED_URLS = new Set([
   "https://mediaserver.abnvideos.com/streams/abnchina.m3u8",
-  "https://restream.pdtvhd.com/memfs/c1cd2ed0-3b2b-4c25-af98-a7fb0b1eb130.m3u8",
   "https://stream2.jlntv.cn/baicheng1/sd/live.m3u8",
-  "https://video.bread-tv.com:8091/hls-live24/online/index.m3u8",
-  "http://74.91.26.218:82/live/cctv1hd.m3u8",
-  "http://74.91.26.218:82/live/cctv3hd.m3u8",
-  "http://74.91.26.218:82/live/cctv12hd.m3u8",
   "http://113.64.146.48:1688/hls/4/index.m3u8",
-  "http://play1-qk.nmtv.cn/live/1735546697341033.m3u8",
   "http://hwapi.yntv.net/ew265l/848y54.m3u8",
-  "https://stream.sun0769.com/dgrtv1/mp4tv1_800/index.m3u8",
   "https://h5cul1yar48um3t.wcetv.com/hls/gdsatellite.m3u8",
   "http://111.59.24.227:8181/tsfile/live/1001_1.m3u8?key=txiptv&playlive=1&authid=0",
-  "https://tencentplaybusiness.gztv.com/live/zonghes.m3u8",
-  "https://event.pull.hebtv.com/live/live101.m3u8",
-  "https://p8.vzan.com/slowlive/415983998730568937/live.m3u8",
-  "http://hlsal-ldvt.qing.mgtv.com/nn_live/nn_x64/dWlwPTEyNy4wLjAuMSZ1aWQ9cWluZy1jbXMmbm5fdGltZXpvbmU9OCZjZG5leF9pZD1hbF9obHNfbGR2dCZ1dWlkPTliODY4NmU5ZTM2YzYwMmMmZT02OTE0NjA0JnY9MSZpZD1ITldTWkdTVCZzPTcwN2RiYTc2YzJjNmJmMTQ4MmUyZGYzOWU2NWM3YWFi/HNWSZGST.m3u8",
   "https://stream.jmtv.com.cn/xwzh/sd/live.m3u8?_upt=341f4b8e1791883036",
   "http://110.185.237.164:8888/hls/30/index.m3u8",
   "https://liveplus.lzr.com.cn/xwzh/HD/live.m3u8",
   "https://liveplus.lzr.com.cn/wlpd/HD/live.m3u8",
-  "https://cdn4.skygo.mn/live/disk1/NeigMGL/HLSv3-FTA/NeigMGL.m3u8",
   "http://video10.qtv.com.cn/drm/qtv1at/manifest.m3u8",
   "http://video10.qtv.com.cn/drm/qtv2at/manifest.m3u8",
   "http://video10.qtv.com.cn/drm/qtv3at/manifest.m3u8",
@@ -594,8 +582,6 @@ const LIVE_SEED_URLS = new Set([
   "http://stream2.jlntv.cn/sptv/sd/live.m3u8?_upt=f27750421743154598",
   "http://120.70.60.179:9901/tsfile/live/1002_1.m3u8?key=txiptv&playlive=1&authid=0",
   "http://120.70.60.179:9901/tsfile/live/1002_1.m3u8?authid=0&key=txiptv&playlive=1",
-  "https://live.vtibet.cn/live/ZYWS20261016.stream.m3u8",
-  "https://ali-m-l.cztv.com/channels/lantian/channel10/1080p.m3u8",
 ]);
 
 /** 频道可用性探活缓存：url -> { ok, ts }。TTL 6 小时（源会随时间失效，缓存不宜过长）。 */
@@ -897,7 +883,11 @@ async function probeLiveChannel(channelUrl) {
       if (text.trim().startsWith('#EXTM3U')) {
         const segs = text.split(/\r?\n/).map((l) => l.trim())
           .filter((l) => l && !l.startsWith('#'));
-        if (segs.length > 0) {
+        // Media3 的 HlsPlaylistTracker 在媒体 playlist 分片数 <= MIN_PLAYLIST_SEGMENT_COUNT(=3) 时
+        // 会抛 PlaylistStuckException（表现为 ERROR_CODE_IO_UNSPECIFIED）。
+        // 滚动窗口只有 3 个分片的源必然在起播约 30 秒后被判「卡住」而中断 —— 与其等播放器报错，
+        // 不如在服务端就只放行分片数充足的源。
+        if (segs.length >= MIN_PLAYLIST_SEGMENTS) {
           const last = new URL(segs[segs.length - 1], base).href;
           // 轻量取分片头部
           const sres = await fetch(last, {
