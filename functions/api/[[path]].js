@@ -8,7 +8,8 @@
  *     POST /api/auth   {"password"}       -> {"success":true} + Set-Cookie: ltv_session
  *     POST /api/search {"wd","sources"}   -> {list:[...], failures:[...]}
  *     GET  /api/detail?id=&source=        -> {episodes:[m3u8字符串...], videoInfo:{...}}
- *     GET  /api/douban?type&tag&...       -> {items:[{id,title,cover,rating}]}
+ *     GET  /api/douban?type&tag&...       -> {items:[{id,title,cover,rating}]}，cover 已改写为本站 /api/image 代理地址
+ *     GET  /api/image?url=<豆瓣图片地址>  -> 图片二进制（免登录，仅白名单域名；解决豆瓣 Referer 防盗链 418）
  *     GET  /api/live/playlist?url=        -> {channels:[{id,name,url,logo,group,tvgId}], groups:[...]}
  *     GET  /api/source-list?url=          -> {sources:[...], liveSources:[...]}
  *     POST /api/source/test {"url"}       -> {ok:bool, count:int}
@@ -809,6 +810,81 @@ async function handleDetail(env, request) {
   }
 }
 
+// ────────────────────────────── 封面图片代理 ──────────────────────────────
+/**
+ * 豆瓣图片 CDN 有 Referer 防盗链：不带豆瓣 Referer 直接取图会返回 HTTP 418，
+ * body 只有 14 字节（空图）。电视端图片加载器必然失败 → 满屏蓝色占位块。
+ * 由服务端带合法 Referer 回源，并把封面地址改写成「当前站点」的 /api/image，
+ * 电视只请求自己的域名，不再直连豆瓣 CDN。
+ *
+ * 安全：图片请求通常不带会话 Cookie，因此 /api/image 免登录，
+ * 但用域名白名单锁死，只允许豆瓣图片域，避免被当成任意 URL 代理 / SSRF 跳板。
+ */
+const IMAGE_PROXY_ALLOWED_SUFFIXES = ['.doubanio.com', '.douban.com'];
+
+function isAllowedImageHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return IMAGE_PROXY_ALLOWED_SUFFIXES.some(
+    (suffix) => h === suffix.slice(1) || h.endsWith(suffix),
+  );
+}
+
+function proxyImageUrl(request, raw) {
+  const cover = String(raw || '').trim();
+  if (!cover) return '';
+  try {
+    const u = new URL(cover);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return cover;
+    if (!isAllowedImageHost(u.hostname)) return cover;
+    return `${new URL(request.url).origin}/api/image?url=${encodeURIComponent(cover)}`;
+  } catch {
+    return cover;
+  }
+}
+
+/** GET /api/image?url=<豆瓣图片地址> —— 免登录，仅代理白名单域名 */
+async function handleImage(env, request) {
+  const raw = new URL(request.url).searchParams.get('url') || '';
+  if (!raw || raw.length > 2048) return new Response('缺少图片地址', { status: 400 });
+  let target;
+  try {
+    target = new URL(raw);
+  } catch {
+    return new Response('图片地址非法', { status: 400 });
+  }
+  if (!isAllowedImageHost(target.hostname) || !isAllowedUrl(target.href)) {
+    return new Response('图片域名不在允许范围内', { status: 403 });
+  }
+  try {
+    const { res } = await fetchUpstream(target.href, {
+      timeoutMs: 10000,
+      headers: {
+        'User-Agent': UA,
+        Referer: 'https://movie.douban.com/',
+        Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    });
+    const type = res.headers.get('content-type') || '';
+    if (!res.ok || !/^image\//i.test(type)) {
+      return new Response('上游图片获取失败', { status: 502 });
+    }
+    const buf = await res.arrayBuffer();
+    // 418 的防盗链空响应只有 14 字节，直接挡掉，别让客户端拿到坏图
+    if (buf.byteLength < 100) return new Response('图片内容为空', { status: 502 });
+    return new Response(buf, {
+      status: 200,
+      headers: {
+        'Content-Type': type,
+        'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+        'Access-Control-Allow-Origin': '*',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  } catch {
+    return new Response('上游图片获取失败', { status: 502 });
+  }
+}
+
 async function handleDouban(env, request) {
   const guarded = await guard(env, request);
   if (guarded) return guarded;
@@ -821,7 +897,9 @@ async function handleDouban(env, request) {
 
   const cacheKey = `douban:${type}:${tag}:${pageStart}:${pageSize}`;
   const cached = cacheGet(cacheKey);
-  if (cached) return json({ items: cached });
+  if (cached) {
+    return json({ items: cached.map((i) => ({ ...i, cover: proxyImageUrl(request, i.cover) })) });
+  }
 
   const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${encodeURIComponent(
     tag,
@@ -868,7 +946,7 @@ async function handleDouban(env, request) {
     isTv: type === 'tv',
   }));
   cacheSet(cacheKey, items, 10 * 60 * 1000);
-  return json({ items });
+  return json({ items: items.map((i) => ({ ...i, cover: proxyImageUrl(request, i.cover) })) });
 }
 
 
@@ -1083,6 +1161,7 @@ const ROUTES = {
   search: { methods: ['POST'], handler: handleSearch },
   detail: { methods: ['GET'], handler: handleDetail },
   douban: { methods: ['GET'], handler: handleDouban },
+  image: { methods: ['GET'], handler: handleImage },
   'live/playlist': { methods: ['GET'], handler: handleLivePlaylist },
   'live/probe': { methods: ['GET'], handler: handleLiveProbe },
   'source-list': { methods: ['GET'], handler: handleSourceList },
