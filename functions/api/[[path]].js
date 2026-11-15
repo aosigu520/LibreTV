@@ -832,6 +832,10 @@ async function handleDetail(env, request) {
  *   - 其它二进制       -> 原样/流式转发，透传 Range 与 Content-Range
  *  每一层目标都过 isAllowedUrl（SSRF），并禁止嵌套代理自身。
  *  免登录：客户端的图片/分片请求不一定带会话 Cookie。
+ *
+ *  ⚠️ 但完整代理只对图片默认启用。媒体资源默认 302 交还电视直连（理由见
+ *  handleProxy 内的实测数据），上面的 HLS 改写分支只在环境变量
+ *  LIVE_PROXY_MODE=full 时才会走到，保留它便于日后排查/换部署方案。
  */
 const DOUBAN_IMAGE_SUFFIXES = ['.doubanio.com', '.douban.com'];
 
@@ -908,8 +912,30 @@ async function handleProxy(env, request) {
     return new Response('资源地址不在允许范围内', { status: 403 });
   }
 
-  const isManifest = isHlsPlaylistUrl(target);
   const douban = isDoubanImageHost(target.hostname);
+
+  // 2026-11-15 实测结论（不是推测）：
+  //  Cloudflare 回源国内 IPTV 的 ts 分片要 3.9–7.4s / 约 600KB，
+  //  而分片本身时长只有 4–6s，另有约 1/3 请求直接超时；
+  //  走代理必然把播放缓冲耗光 → 反复重连、起播失败。
+  //  Mac 直连同一分片只需 0.42s。
+  // 因此媒体资源默认 302 交还电视直连源站（恢复 1.2.0 的行为），
+  // 只有豆瓣图片必须留在服务端代理（要带 Referer，否则 418 空图）。
+  // 已知限制：Media3 默认不允许 https→http 跨协议重定向，http 源可能失败；
+  // 需要强制完整代理排查时，设环境变量 LIVE_PROXY_MODE=full。
+  const looksLikeImage = /\.(?:jpe?g|png|webp|gif|avif|bmp|ico)(?:\?|$)/i.test(target.href);
+  if (!douban && !looksLikeImage && env.LIVE_PROXY_MODE !== 'full') {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: target.href,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
+  const isManifest = isHlsPlaylistUrl(target);
   const headers = { 'User-Agent': UA };
   if (douban) {
     headers.Referer = 'https://movie.douban.com/';
