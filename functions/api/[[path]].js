@@ -9,8 +9,10 @@
  *     POST /api/search {"wd","sources"}   -> {list:[...], failures:[...]}
  *     GET  /api/detail?id=&source=        -> {episodes:[m3u8字符串...], videoInfo:{...}}
  *     GET  /api/douban?type&tag&...       -> {items:[{id,title,cover,rating}]}，cover 保持原始 URL
- *     GET  /api/proxy?url=<图片地址>      -> 图片二进制（客户端约定的图片代理，必须实现，否则首页海报全空）
- *     GET  /api/image?url=<图片地址>      -> 同上，兼容别名
+ *     GET  /api/proxy?url=<资源地址>      -> 图片字节 / HLS manifest（分片 URI 已改写为本站代理）/ ts 等二进制
+ *                                            DpadTV 1.3.0 把封面、直播 manifest、分片全走这里；
+ *                                            不实现则首页海报全空 + 直播全部 502 无法起播
+ *     GET  /api/image?url=<资源地址>      -> 同上，兼容别名
  *     GET  /api/live/playlist?url=        -> {channels:[{id,name,url,logo,group,tvgId}], groups:[...]}
  *     GET  /api/source-list?url=          -> {sources:[...], liveSources:[...]}
  *     POST /api/source/test {"url"}       -> {ok:bool, count:int}
@@ -811,20 +813,25 @@ async function handleDetail(env, request) {
   }
 }
 
-// ────────────────────────────── 图片代理 ──────────────────────────────
+// ────────────────────── 通用资源代理（图片 + HLS 直播流） ──────────────────────
 /**
- * 真正的根因（反编译 DpadTV 1.3.0 的 classes3.dex 确认）：
- * 客户端不是自己直接加载 cover，而是把封面地址包成
+ * 反编译 DpadTV 1.3.0 的 classes3.dex 确认：客户端把「所有」外链资源统一包成
  *   GET /api/proxy?url=<encoded>
- * 由服务端取回图片字节（Api.imageBytes）。旧版 Pages Functions 没有 /api/proxy
- * 路由 → 每张图都 404 → 满屏蓝色占位块。所以 /api/douban 的 cover 必须保持
- * 原始 URL，让客户端自己来包代理，服务端不要再改写它。
+ * 既包括豆瓣封面（Api.imageBytes），也包括直播/点播的 m3u8 manifest 与 HLS 分片。
  *
- * 实现要点：
- *  - 任意公网 http/https，但必须经过 isAllowedUrl 的 SSRF 校验
- *  - 豆瓣图片域额外带 Referer（否则豆瓣 CDN 返回 418 + 14 字节空图）
- *  - 只放行 image/* 响应，挡掉 HTML/JSON 错误页、空图和超大文件
- *  - 免登录：客户端图片请求不一定带会话 Cookie
+ * 历史教训（2026-11-15）：
+ *  第一版 /api/proxy 只放行 image/*。结果 1.3.0 的直播流全部拿到 502，
+ *  logcat 里连续 100 次 ERROR_CODE_IO_BAD_HTTP_STATUS / mediaPos=0.00，
+ *  连起播都做不到，更谈不上验证历史遗留的「播 30 秒断流」。
+ *
+ * 现在按资源类型分三路：
+ *   - image/*         -> 返回字节；豆瓣域带 Referer（否则 418 空图）
+ *   - HLS playlist    -> 读文本，把每行分片 URI 与 EXT-X-KEY/MAP 的 URI
+ *                        改写成「本站 /api/proxy?url=绝对源地址」。
+ *                        不改写的话播放器会拿 /api/xxx.ts 请求本站 → 404
+ *   - 其它二进制       -> 原样/流式转发，透传 Range 与 Content-Range
+ *  每一层目标都过 isAllowedUrl（SSRF），并禁止嵌套代理自身。
+ *  免登录：客户端的图片/分片请求不一定带会话 Cookie。
  */
 const DOUBAN_IMAGE_SUFFIXES = ['.doubanio.com', '.douban.com'];
 
@@ -847,47 +854,153 @@ function decodeUrlParam(raw) {
   return v;
 }
 
-/** GET /api/proxy?url=<图片地址> —— 客户端约定的图片代理 */
+function isHlsPlaylistUrl(target) {
+  return /\.m3u8?$/i.test(target.pathname);
+}
+
+/** 把 m3u8 内所有 URI 改成走本站 /api/proxy 的绝对地址 */
+function rewriteHlsPlaylist(text, baseUrl, origin) {
+  const wrap = (abs) => `${origin}/api/proxy?url=${encodeURIComponent(abs)}`;
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith('#')) {
+        if (!/URI\s*=/i.test(trimmed)) return line;
+        return line.replace(/URI\s*=\s*"([^"]+)"/gi, (match, uri) => {
+          try {
+            const abs = new URL(uri, baseUrl).href;
+            if (!/^https?:$/.test(new URL(abs).protocol) || !isAllowedUrl(abs)) return match;
+            return `URI="${wrap(abs)}"`;
+          } catch {
+            return match;
+          }
+        });
+      }
+      try {
+        const abs = new URL(trimmed, baseUrl).href;
+        if (!/^https?:$/.test(new URL(abs).protocol) || !isAllowedUrl(abs)) return line;
+        return wrap(abs);
+      } catch {
+        return line;
+      }
+    })
+    .join('\n');
+}
+
+/** GET /api/proxy?url=<资源地址> —— 免登录，图片 / HLS 通用 */
 async function handleProxy(env, request) {
-  const raw = decodeUrlParam(new URL(request.url).searchParams.get('url'));
-  if (!raw || raw.length > 2048) return new Response('缺少图片地址', { status: 400 });
+  const reqUrl = new URL(request.url);
+  const raw = decodeUrlParam(reqUrl.searchParams.get('url'));
+  if (!raw || raw.length > 2048) return new Response('缺少资源地址', { status: 400 });
   let target;
   try {
     target = new URL(raw);
   } catch {
-    return new Response('图片地址非法', { status: 400 });
+    return new Response('资源地址非法', { status: 400 });
+  }
+  // 防止 /api/proxy?url=.../api/proxy?... 造成无限递归
+  if (/\/api\/proxy\/?$/i.test(target.pathname)) {
+    return new Response('不允许嵌套代理', { status: 403 });
   }
   if (!isAllowedUrl(target.href)) {
-    return new Response('图片地址不在允许范围内', { status: 403 });
+    return new Response('资源地址不在允许范围内', { status: 403 });
   }
-  const headers = {
-    'User-Agent': UA,
-    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-  };
-  if (isDoubanImageHost(target.hostname)) headers.Referer = 'https://movie.douban.com/';
+
+  const isManifest = isHlsPlaylistUrl(target);
+  const douban = isDoubanImageHost(target.hostname);
+  const headers = { 'User-Agent': UA };
+  if (douban) {
+    headers.Referer = 'https://movie.douban.com/';
+    headers.Accept = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8';
+  } else if (isManifest) {
+    headers.Accept = 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*';
+  } else {
+    headers.Accept = '*/*';
+  }
+  const range = request.headers.get('Range');
+  if (range && range.length <= 128) headers.Range = range;
+
+  let res;
+  let finalUrl;
   try {
-    const { res } = await fetchUpstream(target.href, { timeoutMs: 12000, headers });
-    const type = res.headers.get('content-type') || '';
-    if (!res.ok || !/^image\//i.test(type)) {
-      return new Response('上游图片获取失败', { status: 502 });
-    }
-    const buf = await res.arrayBuffer();
-    // 挡掉 418 防盗链空响应（14 字节）和异常大文件
-    if (buf.byteLength < 100 || buf.byteLength > 8 * 1024 * 1024) {
-      return new Response('图片内容异常', { status: 502 });
-    }
-    return new Response(buf, {
-      status: 200,
-      headers: {
-        'Content-Type': type,
-        'Cache-Control': 'public, max-age=86400, s-maxage=604800',
-        'Access-Control-Allow-Origin': '*',
-        'X-Content-Type-Options': 'nosniff',
-      },
+    const r = await fetchUpstream(target.href, {
+      timeoutMs: isManifest ? 12000 : 20000,
+      headers,
+      retries: isManifest ? 1 : 0,
     });
+    res = r.res;
+    finalUrl = r.finalUrl;
   } catch {
-    return new Response('上游图片获取失败', { status: 502 });
+    return new Response('上游资源获取失败', { status: 502 });
   }
+  if (!res.ok) {
+    return new Response(`上游返回 ${res.status}`, { status: res.status === 404 ? 404 : 502 });
+  }
+
+  const type = (res.headers.get('content-type') || '').split(';')[0].trim();
+  const common = {
+    'Access-Control-Allow-Origin': '*',
+    'X-Content-Type-Options': 'nosniff',
+  };
+  const contentRange = res.headers.get('Content-Range');
+  const passthrough = () => ({
+    ...common,
+    'Content-Type': type || 'application/octet-stream',
+    'Cache-Control': 'public, max-age=2',
+    ...(contentRange ? { 'Content-Range': contentRange } : {}),
+  });
+
+  // 1) 图片
+  if (/^image\//i.test(type)) {
+    try {
+      const buf = await res.arrayBuffer();
+      // 挡掉 418 防盗链空响应（14 字节）和异常大文件
+      if (buf.byteLength < 100 || buf.byteLength > 8 * 1024 * 1024) {
+        return new Response('图片内容异常', { status: 502 });
+      }
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          ...common,
+          'Content-Type': type,
+          'Cache-Control': 'public, max-age=86400, s-maxage=604800',
+        },
+      });
+    } catch {
+      return new Response('图片读取失败', { status: 502 });
+    }
+  }
+
+  // 2) 小响应：探测是不是 HLS playlist。
+  //    很多 IPTV 源不带 .m3u8 扩展名、content-type 也乱填，只看 URL 会漏。
+  const declaredLen = Number(res.headers.get('content-length') || 0);
+  if (isManifest || declaredLen === 0 || declaredLen <= 512 * 1024) {
+    let buf;
+    try {
+      buf = await res.arrayBuffer();
+    } catch {
+      return new Response('资源读取失败', { status: 502 });
+    }
+    const head = dec.decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 32)));
+    if (head.includes('#EXTM3U')) {
+      const rewritten = rewriteHlsPlaylist(dec.decode(buf), finalUrl, reqUrl.origin);
+      return new Response(rewritten, {
+        status: 200,
+        headers: {
+          ...common,
+          'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+          // 直播 manifest 是滚动窗口，绝不能缓存
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        },
+      });
+    }
+    return new Response(buf, { status: res.status, headers: passthrough() });
+  }
+
+  // 3) 大分片：流式转发，避免整段读进内存
+  return new Response(res.body, { status: res.status, headers: passthrough() });
 }
 
 async function handleDouban(env, request) {
