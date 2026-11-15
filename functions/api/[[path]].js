@@ -14,7 +14,8 @@
  *                                            不实现则首页海报全空 + 直播全部 502 无法起播
  *     GET  /api/image?url=<资源地址>      -> 同上，兼容别名
  *     GET  /api/live/playlist?url=        -> {channels:[{id,name,url,logo,group,tvgId}], groups:[...]}
- *                                            channels 已置顶：央视 → 湖南台 → 中国台湾地区 → 其余原序
+ *                                            已置顶：央视 → 湖南台 → 中国台湾地区 → 其余原序；
+ *                                            客户端按 group 分组渲染，故目标频道另归入 0/1/2 数字前缀分组
  *     GET  /api/source-list?url=          -> {sources:[...], liveSources:[...]}
  *     POST /api/source/test {"url"}       -> {ok:bool, count:int}
  *
@@ -543,23 +544,34 @@ function parseM3u(content, baseUrl) {
 
 // ────────────────────────────── 直播频道置顶排序 ──────────────────────────────
 /**
- * /api/live/playlist 返回的 channels 顺序，就是电视端直播列表的显示顺序。
- * iptv-org 的 M3U 按频道英文字母排序，CCTV 被 "A/B" 开头的频道挤到中间，
- * 湖南台、中国台湾地区频道更靠后，用遥控器翻很久才能看到。
+ * 把常用频道送到电视列表首屏。
  *
- * 这里按收视习惯把三类频道提到最前，其余频道保持订阅源原顺序（稳定排序）：
+ * ⚠️ 实测（DpadTV 1.3.0，2026-11-15）：客户端**不按 channels 数组顺序渲染**，
+ *   而是按 group 分组显示，分组顺序按组名字母/中文排序（首屏是 Animation;Kids、
+ *   Business、Classic…）。所以只调整数组顺序在电视上完全无效，必须同时改 group。
+ *   数字前缀 0/1/2 在 localeCompare('zh') 与 Intl.Collator('zh') 里都稳定排在
+ *   所有英文字母组之前，且用户点「分组」筛选时也能直接选到这三组。
+ *
+ * 具体做两件事，二者缺一不可：
+ *   1. channels：三类目标频道排到数组最前（稳定排序，其余相对顺序不变）
+ *   2. group：三类目标频道归入「0 央视频道 / 1 湖南台 / 2 中国台湾地区」，
+ *      原分组存进 originalGroup 备查；groups 数组把这三类显式放最前
+ *
+ * 分层：
  *   tier 0  中央电视台（CCTV / CGTN / 央视），内部按主频道号 1..17 升序
  *   tier 1  湖南广播电视台旗下（Hunan TV / 湖南卫视 / 芒果），卫视优先
  *   tier 2  中国台湾地区频道（iptv-org 的 tvg-id 以 .tw@ 结尾，或名称含台湾台名）
- *   tier 3  其它频道，顺序完全不变
+ *   tier 3  其它频道，顺序、group 完全不变
  *
- * ⚠️ 只调整数组顺序：不增删频道、不改写 name / url / group / logo 等任何字段，
- *   也不影响 /api/live/probe 的探活结果。
+ * 不增删频道，不改写 name / url / logo / tvgId；/api/live/probe 探活不受影响。
+ * 想退回原分组：把 LIVE_PIN_REGROUP 改成 false（数组顺序仍会调整）。
  */
+const LIVE_PIN_REGROUP = true;
 const PIN_TIER_CCTV = 0;
 const PIN_TIER_HUNAN = 1;
 const PIN_TIER_TAIWAN = 2;
 const PIN_TIER_OTHER = 3;
+const LIVE_PIN_GROUPS = ['0 央视频道', '1 湖南台', '2 中国台湾地区'];
 
 function isCctvChannel(c) {
   return /^(CCTV|CGTN|CNTV)/i.test(c.name || '')
@@ -607,7 +619,20 @@ function pinLiveChannels(channels) {
       return { c, i, tier, sub };
     })
     .sort((a, b) => a.tier - b.tier || a.sub - b.sub || a.i - b.i)
-    .map((x) => x.c);
+    .map(({ c, tier }) => {
+      if (!LIVE_PIN_REGROUP || tier === PIN_TIER_OTHER) return c;
+      // 只改 group，原分组保留在 originalGroup，客户端忽略未知字段不受影响
+      return { ...c, originalGroup: c.group, group: LIVE_PIN_GROUPS[tier] };
+    });
+}
+
+/** 分组列表：常用分组显式置顶，其余仍按中文 locale 排序 */
+function buildLiveGroups(channels) {
+  const rest = [...new Set(
+    channels.map((c) => c.group).filter((g) => g && !LIVE_PIN_GROUPS.includes(g)),
+  )].sort((a, b) => a.localeCompare(b, 'zh'));
+  const pinned = LIVE_PIN_GROUPS.filter((g) => channels.some((c) => c.group === g));
+  return [...pinned, ...rest];
 }
 
 // ────────────────────────────── 订阅（source-list）解析 ──────────────────────────────
@@ -1303,10 +1328,11 @@ async function handleLivePlaylist(env, request) {
   // ⚠️ 列表返回全量，不做过滤。
   // 曾经按「分片数 / 末片可达」筛掉过一批源，但那些判据与 Media3 实际报错的对应关系没有完全验证，
   // 过滤反而把可用的源也藏起来了。探活能力保留在 /api/live/probe 端点，按需调用。
-  // 唯一会动的是顺序：央视 → 湖南台 → 中国台湾地区频道置顶，其余保持订阅源原顺序。
+  // 唯一会动的是顺序与分组：央视 → 湖南台 → 中国台湾地区频道置顶，其余保持订阅源原顺序。
+  // 客户端按 group 分组渲染，详见 pinLiveChannels 的注释。
   const channels = pinLiveChannels(all);
 
-  const groups = [...new Set(channels.map((c) => c.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh'));
+  const groups = buildLiveGroups(channels);
   const playlist = { channels, groups };
   cacheSet(cacheKey, playlist, 10 * 60 * 1000);
   return json(playlist, 200, { 'Cache-Control': 'no-store' });
