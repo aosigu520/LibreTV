@@ -14,6 +14,7 @@
  *                                            不实现则首页海报全空 + 直播全部 502 无法起播
  *     GET  /api/image?url=<资源地址>      -> 同上，兼容别名
  *     GET  /api/live/playlist?url=        -> {channels:[{id,name,url,logo,group,tvgId}], groups:[...]}
+ *                                            channels 已置顶：央视 → 湖南台 → 中国台湾地区 → 其余原序
  *     GET  /api/source-list?url=          -> {sources:[...], liveSources:[...]}
  *     POST /api/source/test {"url"}       -> {ok:bool, count:int}
  *
@@ -538,6 +539,75 @@ function parseM3u(content, baseUrl) {
     });
   }
   return channels;
+}
+
+// ────────────────────────────── 直播频道置顶排序 ──────────────────────────────
+/**
+ * /api/live/playlist 返回的 channels 顺序，就是电视端直播列表的显示顺序。
+ * iptv-org 的 M3U 按频道英文字母排序，CCTV 被 "A/B" 开头的频道挤到中间，
+ * 湖南台、中国台湾地区频道更靠后，用遥控器翻很久才能看到。
+ *
+ * 这里按收视习惯把三类频道提到最前，其余频道保持订阅源原顺序（稳定排序）：
+ *   tier 0  中央电视台（CCTV / CGTN / 央视），内部按主频道号 1..17 升序
+ *   tier 1  湖南广播电视台旗下（Hunan TV / 湖南卫视 / 芒果），卫视优先
+ *   tier 2  中国台湾地区频道（iptv-org 的 tvg-id 以 .tw@ 结尾，或名称含台湾台名）
+ *   tier 3  其它频道，顺序完全不变
+ *
+ * ⚠️ 只调整数组顺序：不增删频道、不改写 name / url / group / logo 等任何字段，
+ *   也不影响 /api/live/probe 的探活结果。
+ */
+const PIN_TIER_CCTV = 0;
+const PIN_TIER_HUNAN = 1;
+const PIN_TIER_TAIWAN = 2;
+const PIN_TIER_OTHER = 3;
+
+function isCctvChannel(c) {
+  return /^(CCTV|CGTN|CNTV)/i.test(c.name || '')
+    || /^(CCTV|CGTN|CNTV)/i.test(c.tvgId || '')
+    || /央视|中央电视|中央广播电视总台/.test(c.name || '');
+}
+
+function isHunanChannel(c) {
+  return /hunan|湖南|芒果|mango|金鹰/i.test(
+    `${c.name || ''} ${c.tvgId || ''} ${c.rawName || ''}`,
+  );
+}
+
+function isTaiwanRegionChannel(c) {
+  // iptv-org 里中国台湾地区频道的 tvg-id 统一形如 FTV.tw@SD / TVBSNews.tw@SD，最可靠
+  const id = c.tvgId || '';
+  if (/\.tw@/i.test(id) || /\.tw$/i.test(id)) return true;
+  return /taiwan|台湾|台视|中视|华视|民视|三立|东森|中天|TVBS|八大电视|年代电视|非凡电视|公视|客家电视|原住民族/i
+    .test(c.name || '');
+}
+
+/** 央视内部排序：CCTV-1..17 → CCTV+ 外宣 → 其它专业频道（台球/高尔夫/风云剧场等） */
+function cctvSubRank(name) {
+  const main = String(name).match(/^CCTV-(\d+)/i);
+  if (main) return Number(main[1]);
+  const plus = String(name).match(/^CCTV\+\s*(\d+)/i);
+  if (plus) return 100 + Number(plus[1]);
+  return 200;
+}
+
+function pinLiveChannels(channels) {
+  return channels
+    .map((c, i) => {
+      let tier = PIN_TIER_OTHER;
+      let sub = 0;
+      if (isCctvChannel(c)) {
+        tier = PIN_TIER_CCTV;
+        sub = cctvSubRank(c.name);
+      } else if (isHunanChannel(c)) {
+        tier = PIN_TIER_HUNAN;
+        sub = /^Hunan TV\b|湖南卫视/i.test(c.name || '') ? 0 : 1;
+      } else if (isTaiwanRegionChannel(c)) {
+        tier = PIN_TIER_TAIWAN;
+      }
+      return { c, i, tier, sub };
+    })
+    .sort((a, b) => a.tier - b.tier || a.sub - b.sub || a.i - b.i)
+    .map((x) => x.c);
 }
 
 // ────────────────────────────── 订阅（source-list）解析 ──────────────────────────────
@@ -1230,12 +1300,11 @@ async function handleLivePlaylist(env, request) {
 
   const all = parseM3u(text, url);
 
-  // 只保留实测能播的频道：滚动窗口极小的源会在起播约 30 秒后因分片 404 而中断。
-  // 未探活过的频道先用部署期实测基线兜底（LIVE_SEED_URLS），其余等轮转探活后再收录。
   // ⚠️ 列表返回全量，不做过滤。
   // 曾经按「分片数 / 末片可达」筛掉过一批源，但那些判据与 Media3 实际报错的对应关系没有完全验证，
   // 过滤反而把可用的源也藏起来了。探活能力保留在 /api/live/probe 端点，按需调用。
-  const channels = all;
+  // 唯一会动的是顺序：央视 → 湖南台 → 中国台湾地区频道置顶，其余保持订阅源原顺序。
+  const channels = pinLiveChannels(all);
 
   const groups = [...new Set(channels.map((c) => c.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh'));
   const playlist = { channels, groups };
