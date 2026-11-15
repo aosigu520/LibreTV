@@ -8,8 +8,9 @@
  *     POST /api/auth   {"password"}       -> {"success":true} + Set-Cookie: ltv_session
  *     POST /api/search {"wd","sources"}   -> {list:[...], failures:[...]}
  *     GET  /api/detail?id=&source=        -> {episodes:[m3u8字符串...], videoInfo:{...}}
- *     GET  /api/douban?type&tag&...       -> {items:[{id,title,cover,rating}]}，cover 已改写为本站 /api/image 代理地址
- *     GET  /api/image?url=<豆瓣图片地址>  -> 图片二进制（免登录，仅白名单域名；解决豆瓣 Referer 防盗链 418）
+ *     GET  /api/douban?type&tag&...       -> {items:[{id,title,cover,rating}]}，cover 保持原始 URL
+ *     GET  /api/proxy?url=<图片地址>      -> 图片二进制（客户端约定的图片代理，必须实现，否则首页海报全空）
+ *     GET  /api/image?url=<图片地址>      -> 同上，兼容别名
  *     GET  /api/live/playlist?url=        -> {channels:[{id,name,url,logo,group,tvgId}], groups:[...]}
  *     GET  /api/source-list?url=          -> {sources:[...], liveSources:[...]}
  *     POST /api/source/test {"url"}       -> {ok:bool, count:int}
@@ -810,41 +811,45 @@ async function handleDetail(env, request) {
   }
 }
 
-// ────────────────────────────── 封面图片代理 ──────────────────────────────
+// ────────────────────────────── 图片代理 ──────────────────────────────
 /**
- * 豆瓣图片 CDN 有 Referer 防盗链：不带豆瓣 Referer 直接取图会返回 HTTP 418，
- * body 只有 14 字节（空图）。电视端图片加载器必然失败 → 满屏蓝色占位块。
- * 由服务端带合法 Referer 回源，并把封面地址改写成「当前站点」的 /api/image，
- * 电视只请求自己的域名，不再直连豆瓣 CDN。
+ * 真正的根因（反编译 DpadTV 1.3.0 的 classes3.dex 确认）：
+ * 客户端不是自己直接加载 cover，而是把封面地址包成
+ *   GET /api/proxy?url=<encoded>
+ * 由服务端取回图片字节（Api.imageBytes）。旧版 Pages Functions 没有 /api/proxy
+ * 路由 → 每张图都 404 → 满屏蓝色占位块。所以 /api/douban 的 cover 必须保持
+ * 原始 URL，让客户端自己来包代理，服务端不要再改写它。
  *
- * 安全：图片请求通常不带会话 Cookie，因此 /api/image 免登录，
- * 但用域名白名单锁死，只允许豆瓣图片域，避免被当成任意 URL 代理 / SSRF 跳板。
+ * 实现要点：
+ *  - 任意公网 http/https，但必须经过 isAllowedUrl 的 SSRF 校验
+ *  - 豆瓣图片域额外带 Referer（否则豆瓣 CDN 返回 418 + 14 字节空图）
+ *  - 只放行 image/* 响应，挡掉 HTML/JSON 错误页、空图和超大文件
+ *  - 免登录：客户端图片请求不一定带会话 Cookie
  */
-const IMAGE_PROXY_ALLOWED_SUFFIXES = ['.doubanio.com', '.douban.com'];
+const DOUBAN_IMAGE_SUFFIXES = ['.doubanio.com', '.douban.com'];
 
-function isAllowedImageHost(hostname) {
+function isDoubanImageHost(hostname) {
   const h = String(hostname || '').toLowerCase();
-  return IMAGE_PROXY_ALLOWED_SUFFIXES.some(
-    (suffix) => h === suffix.slice(1) || h.endsWith(suffix),
-  );
+  return DOUBAN_IMAGE_SUFFIXES.some((s) => h === s.slice(1) || h.endsWith(s));
 }
 
-function proxyImageUrl(request, raw) {
-  const cover = String(raw || '').trim();
-  if (!cover) return '';
-  try {
-    const u = new URL(cover);
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return cover;
-    if (!isAllowedImageHost(u.hostname)) return cover;
-    return `${new URL(request.url).origin}/api/image?url=${encodeURIComponent(cover)}`;
-  } catch {
-    return cover;
+/** 客户端可能对 url 参数做了二次编码，最多解 3 层直到出现 :// */
+function decodeUrlParam(raw) {
+  let v = String(raw || '');
+  for (let i = 0; i < 3; i++) {
+    if (!/%3a%2f%2f/i.test(v)) break;
+    try {
+      v = decodeURIComponent(v);
+    } catch {
+      break;
+    }
   }
+  return v;
 }
 
-/** GET /api/image?url=<豆瓣图片地址> —— 免登录，仅代理白名单域名 */
-async function handleImage(env, request) {
-  const raw = new URL(request.url).searchParams.get('url') || '';
+/** GET /api/proxy?url=<图片地址> —— 客户端约定的图片代理 */
+async function handleProxy(env, request) {
+  const raw = decodeUrlParam(new URL(request.url).searchParams.get('url'));
   if (!raw || raw.length > 2048) return new Response('缺少图片地址', { status: 400 });
   let target;
   try {
@@ -852,25 +857,25 @@ async function handleImage(env, request) {
   } catch {
     return new Response('图片地址非法', { status: 400 });
   }
-  if (!isAllowedImageHost(target.hostname) || !isAllowedUrl(target.href)) {
-    return new Response('图片域名不在允许范围内', { status: 403 });
+  if (!isAllowedUrl(target.href)) {
+    return new Response('图片地址不在允许范围内', { status: 403 });
   }
+  const headers = {
+    'User-Agent': UA,
+    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+  };
+  if (isDoubanImageHost(target.hostname)) headers.Referer = 'https://movie.douban.com/';
   try {
-    const { res } = await fetchUpstream(target.href, {
-      timeoutMs: 10000,
-      headers: {
-        'User-Agent': UA,
-        Referer: 'https://movie.douban.com/',
-        Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-      },
-    });
+    const { res } = await fetchUpstream(target.href, { timeoutMs: 12000, headers });
     const type = res.headers.get('content-type') || '';
     if (!res.ok || !/^image\//i.test(type)) {
       return new Response('上游图片获取失败', { status: 502 });
     }
     const buf = await res.arrayBuffer();
-    // 418 的防盗链空响应只有 14 字节，直接挡掉，别让客户端拿到坏图
-    if (buf.byteLength < 100) return new Response('图片内容为空', { status: 502 });
+    // 挡掉 418 防盗链空响应（14 字节）和异常大文件
+    if (buf.byteLength < 100 || buf.byteLength > 8 * 1024 * 1024) {
+      return new Response('图片内容异常', { status: 502 });
+    }
     return new Response(buf, {
       status: 200,
       headers: {
@@ -897,9 +902,7 @@ async function handleDouban(env, request) {
 
   const cacheKey = `douban:${type}:${tag}:${pageStart}:${pageSize}`;
   const cached = cacheGet(cacheKey);
-  if (cached) {
-    return json({ items: cached.map((i) => ({ ...i, cover: proxyImageUrl(request, i.cover) })) });
-  }
+  if (cached) return json({ items: cached });
 
   const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${encodeURIComponent(
     tag,
@@ -946,7 +949,7 @@ async function handleDouban(env, request) {
     isTv: type === 'tv',
   }));
   cacheSet(cacheKey, items, 10 * 60 * 1000);
-  return json({ items: items.map((i) => ({ ...i, cover: proxyImageUrl(request, i.cover) })) });
+  return json({ items });
 }
 
 
@@ -1161,7 +1164,8 @@ const ROUTES = {
   search: { methods: ['POST'], handler: handleSearch },
   detail: { methods: ['GET'], handler: handleDetail },
   douban: { methods: ['GET'], handler: handleDouban },
-  image: { methods: ['GET'], handler: handleImage },
+  proxy: { methods: ['GET'], handler: handleProxy },
+  image: { methods: ['GET'], handler: handleProxy },
   'live/playlist': { methods: ['GET'], handler: handleLivePlaylist },
   'live/probe': { methods: ['GET'], handler: handleLiveProbe },
   'source-list': { methods: ['GET'], handler: handleSourceList },
